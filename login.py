@@ -1,54 +1,72 @@
 from selenium import webdriver
-import requests
-url = "https://ise01.umpsa.edu.my:8443/portal/DoCoA.action"
-driver = webdriver.Edge(keep_alive=False)
+from selenium.webdriver.common.by import By
+from selenium.webdriver.edge.options import Options
+from selenium.webdriver.edge.service import Service as EdgeService
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+import csv
+import sys
+import os
 
-driver.get("https://ise01.umpsa.edu.my:8443/portal/PortalSetup.action?portal=2fe2f2b6-84d8-4a26-bc65-9f3e7b86446b") # cookies
-driver.get("https://ise01.umpsa.edu.my:8443/portal/SelfRegistration.action?from=LOGIN")
+def main():
+    url = "http://2.2.2.2/login.html"
+    options = Options()
+    options.add_argument('--headless')
+    options.page_load_strategy = 'eager'
+    service = EdgeService(executable_path="msedgedriver")
 
+    credential_file = 'credentials.csv'
 
-headers = {
-    "Accept": "*/*",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Connection": "keep-alive",
-    "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-    "DNT": "1",
-    "Origin": "https://ise01.umpsa.edu.my:8443",
-    "Referer": "https://ise01.umpsa.edu.my:8443/portal/LoginSubmit.action?from=LOGIN",
-    "Sec-Fetch-Dest": "empty",
-    "Sec-Fetch-Mode": "cors",
-    "Sec-Fetch-Site": "same-origin",
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36 Edg/130.0.0.0",
-    "X-Requested-With": "XMLHttpRequest",
-    "sec-ch-ua": '"Chromium";v="130", "Microsoft Edge";v="130", "Not?A_Brand";v="99"',
-    "sec-ch-ua-arch": '"x86"',
-    "sec-ch-ua-full-version": '"130.0.2849.13"',
-    "sec-ch-ua-mobile": "?0",
-    "sec-ch-ua-model": '""',
-    "sec-ch-ua-platform": '"Windows"',
-    "sec-ch-ua-platform-version": '"15.0.0"',
-}
+    try:
+        with open(credential_file, 'r', newline='') as infile:
+            reader = csv.DictReader(infile)
+            fieldnames = reader.fieldnames
+            first_row = next(reader, None)
+            if not first_row:
+                print("Tidak ada kredensial yang tersedia di file CSV.")
+                sys.exit()
+            username = first_row['Username']
+            password = first_row['Password']
+            remaining_credentials = list(reader)
+    except FileNotFoundError:
+        print(f"File kredensial {credential_file} tidak ditemukan.")
+        sys.exit()
+    except Exception as e:
+        print(f"Terjadi kesalahan saat membaca kredensial: {e}")
+        sys.exit()
 
-cookies = {
-    "checkCookiesEnabled": "value",
-    "token": "O1SGNYJOT2J97D1OZIUMO2NWTQ9D0XUV",
-    "portalSessionId": "621fbfad-0d5b-4a17-98c7-5413016de46d",
-    "APPSESSIONID": "CC6A5CEB291FBDA463151985A34BD98F",
-}
+    with webdriver.Edge(options=options, service=service) as driver:
+        driver.get(url)
+        wait = WebDriverWait(driver, 5)
 
-data = {
-    "delayToCoA": "0",
-    "coaType": "Reauth",
-    "coaSource": "GUEST",
-    "coaReason": "Guest authenticated for network access",
-    "waitForCoA": "true",
-    "portalSessionId": "621fbfad-0d5b-4a17-98c7-5413016de46d",
-    "token": "O1SGNYJOT2J97D1OZIUMO2NWTQ9D0XUV",
-}
+        try:
+            username_field = wait.until(EC.presence_of_element_located((By.ID, "user.username")))
+            password_field = driver.find_element(By.ID, "user.password")
+            login_button = driver.find_element(By.ID, "ui_login_signon_button")
 
-# If the server uses a self-signed certificate, you might need to disable SSL verification.
-# Note: Disabling SSL verification is not recommended for production environments.
-response = requests.post(url, headers=headers, cookies=cookies, data=data, verify=False)
+            username_field.send_keys(username)
+            password_field.send_keys(password)
+            login_button.click()
 
-print(response.status_code)
-print(response.text)
+            aup_text_element = wait.until(EC.presence_of_element_located((By.CLASS_NAME, "cisco-ise-aup-text")))
+            driver.execute_script("arguments[0].scrollTop = arguments[0].scrollHeight;", aup_text_element)
+
+            wait.until(EC.element_to_be_clickable((By.ID, "ui_aup_accept_button"))).click()
+
+            wait.until(EC.title_is('Success'))
+            print("Login berhasil")
+
+        except Exception as e:
+            print(f"Terjadi kesalahan selama login: {e}")
+            sys.exit()
+
+    if remaining_credentials:
+        with open(credential_file, 'w', newline='') as outfile:
+            writer = csv.DictWriter(outfile, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(remaining_credentials)
+    else:
+        os.remove(credential_file)
+
+if __name__ == "__main__":
+    main()
