@@ -15,7 +15,7 @@ from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.edge.options import Options
 from selenium.webdriver.support import expected_conditions as EC
-from selenium.webdriver.support.wait import WebDriverWait
+from selenium.webdriver.support.ui import WebDriverWait
 
 SCOPES = ['https://www.googleapis.com/auth/gmail.readonly']
 TOKEN_FILE = 'token.json'
@@ -36,10 +36,16 @@ def set_dark_mode(root):
 def register_user(index, output_label):
     global completed_registrations
     options = Options()
+    options.use_chromium = True
     options.add_argument('--headless')
-    driver = webdriver.Edge(options=options, keep_alive=False)
+    options.add_argument('--disable-gpu')
+
+    options.set_capability('ms:inPrivate', True)
+
+    driver = None
 
     try:
+        driver = webdriver.Edge(options=options)
         driver.get("https://ise01.umpsa.edu.my:8443/portal/PortalSetup.action?portal=2fe2f2b6-84d8-4a26-bc65-9f3e7b86446b")
         driver.get("https://ise01.umpsa.edu.my:8443/portal/SelfRegistration.action?from=LOGIN")
 
@@ -68,21 +74,26 @@ def register_user(index, output_label):
     except Exception as e:
         with lock:
             output_label.config(text=f"Error selama registrasi {index}: {e}")
-
     finally:
-        driver.quit()
+        if driver:
+            driver.quit()
 
 def start_registration(output_label):
     output_label.config(text="Registrasi dimulai...")
+
     def run():
-        with ThreadPoolExecutor(max_workers=50) as executor:
-            executor.map(lambda i: register_user(i, output_label), range(1, total_accounts + 1))
-        output_label.config(text="Registrasi selesai.")
+        try:
+            with ThreadPoolExecutor(max_workers=50) as executor:
+                executor.map(lambda i: register_user(i, output_label), range(1, total_accounts + 1))
+            output_label.config(text="Registrasi selesai.")
+        except Exception as e:
+            output_label.config(text=f"Kesalahan saat memulai registrasi: {e}")
 
     threading.Thread(target=run).start()
 
 def fetch_emails(output_label):
     output_label.config(text="Mengambil email...")
+
     def run():
         creds = authenticate_gmail()
         if not creds:
@@ -117,14 +128,15 @@ def fetch_emails(output_label):
 
     threading.Thread(target=run).start()
 
-# Fungsi untuk login
 def login(output_label):
     output_label.config(text="Proses login...")
+
     def run():
         url = "http://2.2.2.2/login.html"
         options = Options()
+        options.use_chromium = True
         options.add_argument('--headless')
-        options.page_load_strategy = 'eager'
+        options.add_argument('--disable-gpu')
 
         credential_file = 'credentials.csv'
 
@@ -146,11 +158,11 @@ def login(output_label):
             output_label.config(text=f"Terjadi kesalahan saat membaca kredensial: {e}")
             return
 
-        with webdriver.Edge(options=options) as driver:
-            driver.get(url)
-            wait = WebDriverWait(driver, 5)
+        try:
+            with webdriver.Edge(options=options) as driver:
+                driver.get(url)
+                wait = WebDriverWait(driver, 5)
 
-            try:
                 username_field = wait.until(EC.presence_of_element_located((By.ID, "user.username")))
                 password_field = driver.find_element(By.ID, "user.password")
                 login_button = driver.find_element(By.ID, "ui_login_signon_button")
@@ -166,10 +178,8 @@ def login(output_label):
 
                 wait.until(EC.title_is('Success'))
                 output_label.config(text="Login berhasil")
-
-            except Exception as e:
-                output_label.config(text=f"Terjadi kesalahan selama login: {e}")
-                return
+        except Exception as e:
+            output_label.config(text=f"Terjadi kesalahan selama login: {e}")
 
         if remaining_credentials:
             with open(credential_file, 'w', newline='') as outfile:
