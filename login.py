@@ -1,19 +1,19 @@
+import csv
+import os
+import sys
+
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.edge.options import Options
-from selenium.webdriver.edge.service import Service as EdgeService
-from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-import csv
-import sys
-import os
+from selenium.webdriver.support.ui import WebDriverWait
+
 
 def main():
     url = "http://2.2.2.2/login.html"
     options = Options()
     options.add_argument('--headless')
     options.page_load_strategy = 'eager'
-    service = EdgeService(executable_path="msedgedriver")
 
     credential_file = 'credentials.csv'
 
@@ -35,7 +35,7 @@ def main():
         print(f"Terjadi kesalahan saat membaca kredensial: {e}")
         sys.exit()
 
-    with webdriver.Edge(options=options, service=service) as driver:
+    with webdriver.Edge(options=options) as driver:
         driver.get(url)
         wait = WebDriverWait(driver, 5)
 
