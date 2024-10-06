@@ -1,3 +1,7 @@
 /src/client_secret.json
 /src/credentials.csv
 /src/token.json
+/dist/
+/build/
+/src/app.log
+/main.spec

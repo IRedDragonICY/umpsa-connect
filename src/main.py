@@ -24,10 +24,32 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 from PIL import Image, ImageTk
 
-def resource_path(relative_path):
+def resource_path(relative_path: str) -> str:
+    """
+    Returns the absolute path to the resource, supporting bundling with PyInstaller.
+
+    Args:
+        relative_path (str): Relative path to the resource.
+
+    Returns:
+        str: Absolute path to the resource.
+    """
     base_path = getattr(sys, '_MEIPASS', os.path.abspath("."))
     return os.path.join(base_path, relative_path)
 
+# Type annotations for global variables
+SCOPES: List[str] = ['https://www.googleapis.com/auth/gmail.readonly']
+TOKEN_FILE: str = resource_path('token.json')
+CREDENTIALS_FILE: str = resource_path('client_secret.json')
+CSV_FILE: str = resource_path('credentials.csv')
+TOTAL_ACCOUNTS: int = 5000
+MAX_WORKERS: int = 50
+REGISTRATION_URL: str = "https://ise01.umpsa.edu.my:8443/portal/SelfRegistration.action?from=LOGIN"
+LOGIN_URL: str = "http://2.2.2.2/login.html"
+DRIVER_PATH: str = resource_path(os.path.join('driver', 'msedgedriver.exe'))
+AUTO_LOGIN_INTERVAL: int = 60 * 60  - 3
+
+# Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format='[%(asctime)s] %(levelname)s - %(message)s',
@@ -37,22 +59,11 @@ logging.basicConfig(
     ]
 )
 
-SCOPES = ['https://www.googleapis.com/auth/gmail.readonly']
-TOKEN_FILE = resource_path('token.json')
-CREDENTIALS_FILE = resource_path('client_secret.json')
-CSV_FILE = resource_path('credentials.csv')
-TOTAL_ACCOUNTS = 5000
-MAX_WORKERS = 50
-REGISTRATION_URL = "https://ise01.umpsa.edu.my:8443/portal/SelfRegistration.action?from=LOGIN"
-LOGIN_URL = "http://2.2.2.2/login.html"
-DRIVER_PATH = resource_path(os.path.join('driver', 'msedgedriver.exe'))
-AUTO_LOGIN_INTERVAL = 60 * 60
-
 class Counter:
     def __init__(self, total: int):
-        self.total = total
-        self.completed = 0
-        self.lock = threading.Lock()
+        self.total: int = total
+        self.completed: int = 0
+        self.lock: threading.Lock = threading.Lock()
 
     def increment(self) -> int:
         with self.lock:
@@ -68,8 +79,14 @@ class GmailService:
         self.service = self.authenticate()
 
     @staticmethod
-    def authenticate():
-        creds = None
+    def authenticate() -> any:
+        """
+        Authenticates with the Gmail API using OAuth 2.0.
+
+        Returns:
+            Resource: Gmail API service resource.
+        """
+        creds: Optional[Credentials] = None
         if os.path.exists(TOKEN_FILE):
             creds = Credentials.from_authorized_user_file(TOKEN_FILE, SCOPES)
             logging.info("Loaded credentials from token file.")
@@ -87,8 +104,18 @@ class GmailService:
         return build('gmail', 'v1', credentials=creds)
 
     def search_emails(self, query: str, user_id: str = 'me') -> List[Dict]:
+        """
+        Searches for emails based on the provided query.
+
+        Args:
+            query (str): The email search query.
+            user_id (str, optional): Gmail user ID. Defaults to 'me'.
+
+        Returns:
+            List[Dict]: List of email messages matching the query.
+        """
         try:
-            messages = []
+            messages: List[Dict] = []
             response = self.service.users().messages().list(userId=user_id, q=query).execute()
             messages.extend(response.get('messages', []))
             while 'nextPageToken' in response:
@@ -102,6 +129,16 @@ class GmailService:
             return []
 
     def get_email_content(self, msg_id: str, user_id: str = 'me') -> str:
+        """
+        Retrieves the content of an email by its message ID.
+
+        Args:
+            msg_id (str): The email message ID.
+            user_id (str, optional): Gmail user ID. Defaults to 'me'.
+
+        Returns:
+            str: The email content in text format.
+        """
         try:
             message = self.service.users().messages().get(userId=user_id, id=msg_id, format='full').execute()
             body = self.extract_body(message.get('payload', {}))
@@ -113,6 +150,15 @@ class GmailService:
 
     @staticmethod
     def extract_body(payload: Dict) -> str:
+        """
+        Extracts the body of an email from its payload.
+
+        Args:
+            payload (Dict): The email payload.
+
+        Returns:
+            str: The email body.
+        """
         if 'parts' in payload:
             for part in payload['parts']:
                 text = GmailService.extract_body(part)
@@ -129,6 +175,15 @@ class GmailService:
         return ''
 
 def extract_credentials(content: str) -> Optional[Dict[str, str]]:
+    """
+    Extracts credentials (Username and Password) from email content.
+
+    Args:
+        content (str): The email content in text format.
+
+    Returns:
+        Optional[Dict[str, str]]: Credentials if found, else None.
+    """
     soup = BeautifulSoup(content, 'html.parser')
     text = soup.get_text()
     username_match = re.search(r'Username:\s*(\S+)', text)
@@ -143,7 +198,20 @@ def extract_credentials(content: str) -> Optional[Dict[str, str]]:
     logging.warning("Failed to extract credentials from email content.")
     return None
 
-def get_webdriver(headless: bool = True, in_private: bool = True) -> webdriver.Edge:
+def get_webdriver(headless: bool = True, in_private: bool = False) -> webdriver.Edge:
+    """
+    Initializes the Selenium WebDriver for Microsoft Edge.
+
+    Args:
+        headless (bool, optional): Run browser in headless mode. Defaults to True.
+        in_private (bool, optional): Run browser in private mode. Defaults to True.
+
+    Returns:
+        webdriver.Edge: An instance of Edge WebDriver.
+
+    Raises:
+        Exception: If the WebDriver fails to initialize.
+    """
     options = Options()
     options.use_chromium = True
     if headless:
@@ -204,6 +272,12 @@ class UMPSAConnectApp:
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
 
     def set_dark_mode(self) -> Dict[str, str]:
+        """
+        Applies dark mode styling to the application.
+
+        Returns:
+            Dict[str, str]: Background and foreground colors.
+        """
         bg_color = "#2e2e2e"
         fg_color = "#ffffff"
         self.root.configure(bg=bg_color)
@@ -211,6 +285,9 @@ class UMPSAConnectApp:
         return {'bg': bg_color, 'fg': fg_color}
 
     def load_logo(self):
+        """
+        Loads and displays the application logo.
+        """
         try:
             img_path = resource_path(os.path.join("assets", "logo.png"))
             with Image.open(img_path) as img:
@@ -223,10 +300,19 @@ class UMPSAConnectApp:
             logging.error(f"Error loading logo: {e}")
 
     def initiate_login(self):
+        """
+        Initiates the login process and schedules auto-login.
+        """
         self.login()
         self.schedule_auto_login()
 
     def register_user(self, index: int):
+        """
+        Automatically registers a user.
+
+        Args:
+            index (int): Index of the user being registered.
+        """
         try:
             with get_webdriver() as driver:
                 driver.get(REGISTRATION_URL)
@@ -253,20 +339,32 @@ class UMPSAConnectApp:
             self.output_label.config(text=f"Error during registration {index}: {e}")
 
     def start_registration(self):
+        """
+        Starts the registration process in parallel.
+        """
         self.output_label.config(text="Registration started...")
         threading.Thread(target=self.run_registration, daemon=True).start()
 
     def run_registration(self):
+        """
+        Executes the registration process using ThreadPoolExecutor.
+        """
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
             executor.map(self.register_user, range(1, self.counter.total + 1))
         self.output_label.config(text="Registration completed.")
         logging.info("All registrations completed.")
 
     def fetch_emails(self):
+        """
+        Initiates the email fetching process.
+        """
         self.output_label.config(text="Fetching emails...")
         threading.Thread(target=self.run_fetch_emails, daemon=True).start()
 
     def run_fetch_emails(self):
+        """
+        Executes the email fetching and extraction process.
+        """
         gmail_service = GmailService()
         query = 'from:Donotreply@ump.edu.my subject:"Your Guest Account Credentials!"'
         messages = gmail_service.search_emails(query=query)
@@ -274,7 +372,7 @@ class UMPSAConnectApp:
             self.output_label.config(text='No emails found.')
             return
 
-        credentials_list = []
+        credentials_list: List[Dict[str, str]] = []
         for msg in messages:
             content = gmail_service.get_email_content(msg['id'])
             creds = extract_credentials(content)
@@ -297,20 +395,35 @@ class UMPSAConnectApp:
             logging.info("No credentials were extracted from the fetched emails.")
 
     def schedule_auto_login(self, interval: int = AUTO_LOGIN_INTERVAL):
+        """
+        Schedules auto-login at specified intervals.
+
+        Args:
+            interval (int, optional): Interval in seconds. Defaults to AUTO_LOGIN_INTERVAL.
+        """
         self.auto_login_timer = threading.Timer(interval, self.auto_login)
         self.auto_login_timer.daemon = True
         self.auto_login_timer.start()
         logging.info(f"Scheduled auto-login every {interval} seconds.")
 
     def auto_login(self):
+        """
+        Performs auto-login and reschedules the next login.
+        """
         self.login()
         self.schedule_auto_login()
 
     def login(self):
+        """
+        Initiates the login process.
+        """
         self.output_label.config(text="Logging in...")
         threading.Thread(target=self.run_login, daemon=True).start()
 
     def run_login(self):
+        """
+        Executes the login process using credentials from the CSV file.
+        """
         try:
             with open(CSV_FILE, 'r', newline='', encoding='utf-8') as infile:
                 reader = csv.DictReader(infile)
@@ -372,6 +485,9 @@ class UMPSAConnectApp:
             logging.error(f"Failed to update credentials file: {e}")
 
     def on_closing(self):
+        """
+        Handles the application closure.
+        """
         if self.auto_login_timer:
             self.auto_login_timer.cancel()
             logging.info("Canceled auto-login timer.")
