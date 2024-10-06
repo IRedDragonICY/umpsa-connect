@@ -1,28 +1,34 @@
 import base64
 import binascii
 import csv
+import logging
 import os
 import re
+import sys
 import threading
 import tkinter as tk
-import logging
-import sys
 from concurrent.futures import ThreadPoolExecutor
-from functools import partial
-from typing import Optional, Dict, List, cast
+from typing import Optional, Dict, List, Any
 
+from PIL import Image, ImageTk, UnidentifiedImageError
 from bs4 import BeautifulSoup
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 from selenium import webdriver
+from selenium.common.exceptions import (
+    NoSuchElementException,
+    TimeoutException,
+    WebDriverException
+)
 from selenium.webdriver.common.by import By
 from selenium.webdriver.edge.options import Options
 from selenium.webdriver.edge.service import Service
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
-from PIL import Image, ImageTk
+
 
 def resource_path(relative_path: str) -> str:
     """
@@ -37,17 +43,20 @@ def resource_path(relative_path: str) -> str:
     base_path = getattr(sys, '_MEIPASS', os.path.abspath("."))
     return os.path.join(base_path, relative_path)
 
+
 # Type annotations for global variables
 SCOPES: List[str] = ['https://www.googleapis.com/auth/gmail.readonly']
 TOKEN_FILE: str = resource_path('token.json')
 CREDENTIALS_FILE: str = resource_path('client_secret.json')
 CSV_FILE: str = resource_path('credentials.csv')
+BACKUP_CSV_FILE: str = resource_path('credentials_backup.csv')
 TOTAL_ACCOUNTS: int = 5000
 MAX_WORKERS: int = 50
 REGISTRATION_URL: str = "https://ise01.umpsa.edu.my:8443/portal/SelfRegistration.action?from=LOGIN"
+REGISTRATION_SESSION: str = "https://ise01.umpsa.edu.my:8443/portal/PortalSetup.action?portal=2fe2f2b6-84d8-4a26-bc65-9f3e7b86446b"
 LOGIN_URL: str = "http://2.2.2.2/login.html"
 DRIVER_PATH: str = resource_path(os.path.join('driver', 'msedgedriver.exe'))
-AUTO_LOGIN_INTERVAL: int = 60 * 60  - 3
+AUTO_LOGIN_INTERVAL: int = 60 * 60  # 1 hour
 
 # Configure logging
 logging.basicConfig(
@@ -55,9 +64,10 @@ logging.basicConfig(
     format='[%(asctime)s] %(levelname)s - %(message)s',
     handlers=[
         logging.FileHandler(resource_path("app.log")),
-        logging.StreamHandler()
+        logging.StreamHandler(sys.stdout)
     ]
 )
+
 
 class Counter:
     def __init__(self, total: int):
@@ -74,12 +84,13 @@ class Counter:
         with self.lock:
             return (self.completed / self.total) * 100 if self.total else 0.0
 
+
 class GmailService:
     def __init__(self):
         self.service = self.authenticate()
 
     @staticmethod
-    def authenticate() -> any:
+    def authenticate() -> Any:
         """
         Authenticates with the Gmail API using OAuth 2.0.
 
@@ -95,15 +106,30 @@ class GmailService:
                 creds.refresh(Request())
                 logging.info("Refreshed expired credentials.")
             else:
-                flow = InstalledAppFlow.from_client_secrets_file(CREDENTIALS_FILE, SCOPES)
-                creds = flow.run_local_server(port=0)
-                logging.info("Obtained new credentials via OAuth flow.")
-            with open(TOKEN_FILE, 'w') as token:
-                token.write(creds.to_json())
-                logging.info("Saved new credentials to token file.")
-        return build('gmail', 'v1', credentials=creds)
+                try:
+                    flow = InstalledAppFlow.from_client_secrets_file(CREDENTIALS_FILE, SCOPES)
+                    creds = flow.run_local_server(port=0)
+                    logging.info("Obtained new credentials via OAuth flow.")
+                except FileNotFoundError:
+                    logging.error(f"Credentials file {CREDENTIALS_FILE} not found.")
+                    raise
+                except Exception as e:
+                    logging.error(f"Failed to obtain credentials: {e}")
+                    raise
+            try:
+                with open(TOKEN_FILE, 'w') as token:
+                    token.write(creds.to_json())
+                    logging.info("Saved new credentials to token file.")
+            except IOError as e:
+                logging.error(f"Failed to save token file: {e}")
+                raise
+        try:
+            return build('gmail', 'v1', credentials=creds)
+        except HttpError as e:
+            logging.error(f"Failed to build Gmail service: {e}")
+            raise
 
-    def search_emails(self, query: str, user_id: str = 'me') -> List[Dict]:
+    def search_emails(self, query: str, user_id: str = 'me') -> List[Dict[str, str]]:
         """
         Searches for emails based on the provided query.
 
@@ -112,10 +138,10 @@ class GmailService:
             user_id (str, optional): Gmail user ID. Defaults to 'me'.
 
         Returns:
-            List[Dict]: List of email messages matching the query.
+            List[Dict[str, str]]: List of email messages matching the query.
         """
         try:
-            messages: List[Dict] = []
+            messages: List[Dict[str, str]] = []
             response = self.service.users().messages().list(userId=user_id, q=query).execute()
             messages.extend(response.get('messages', []))
             while 'nextPageToken' in response:
@@ -124,8 +150,11 @@ class GmailService:
                 messages.extend(response.get('messages', []))
             logging.info(f"Found {len(messages)} messages matching query.")
             return messages
+        except HttpError as e:
+            logging.error(f'HTTP error searching emails: {e}')
+            return []
         except Exception as e:
-            logging.error(f'Error searching emails: {e}')
+            logging.error(f'Unexpected error searching emails: {e}')
             return []
 
     def get_email_content(self, msg_id: str, user_id: str = 'me') -> str:
@@ -144,8 +173,11 @@ class GmailService:
             body = self.extract_body(message.get('payload', {}))
             logging.debug(f"Extracted body from message ID {msg_id}.")
             return body
+        except HttpError as e:
+            logging.error(f'HTTP error retrieving email with ID {msg_id}: {e}')
+            return ''
         except Exception as e:
-            logging.error(f'Failed to retrieve email with ID {msg_id}: {e}')
+            logging.error(f'Unexpected error retrieving email with ID {msg_id}: {e}')
             return ''
 
     @staticmethod
@@ -174,6 +206,7 @@ class GmailService:
                     return ''
         return ''
 
+
 def extract_credentials(content: str) -> Optional[Dict[str, str]]:
     """
     Extracts credentials (Username and Password) from email content.
@@ -198,35 +231,72 @@ def extract_credentials(content: str) -> Optional[Dict[str, str]]:
     logging.warning("Failed to extract credentials from email content.")
     return None
 
-def get_webdriver(headless: bool = True, in_private: bool = False) -> webdriver.Edge:
+
+def get_webdriver(headless: bool = True) -> webdriver.Edge:
     """
-    Initializes the Selenium WebDriver for Microsoft Edge.
+    Initializes the Selenium WebDriver for Microsoft Edge with optimizations
+    to enhance execution speed by disabling CSS, images, and other unnecessary resources.
 
     Args:
         headless (bool, optional): Run browser in headless mode. Defaults to True.
-        in_private (bool, optional): Run browser in private mode. Defaults to True.
 
     Returns:
-        webdriver.Edge: An instance of Edge WebDriver.
+        webdriver.Edge: An optimized instance of Edge WebDriver.
 
     Raises:
-        Exception: If the WebDriver fails to initialize.
+        WebDriverException: If the WebDriver fails to initialize.
     """
     options = Options()
     options.use_chromium = True
+
     if headless:
-        options.add_argument('--headless')
-        options.add_argument('--disable-gpu')
-    if in_private:
-        options.add_argument('--inprivate')
+        # options.add_argument('--headless=new')  # Updated headless mode
+        options.add_argument('--disable-gpu')  # Disable GPU acceleration
+
+    options.add_argument('--disable-extensions')
+    options.add_argument('--disable-popup-blocking')
+    options.add_argument('--disable-dev-shm-usage')
+    options.add_argument('--no-sandbox')
+    options.add_argument('--disable-software-rasterizer')
+
+    prefs = {
+        "profile.managed_default_content_settings.images": 2,
+        "profile.default_content_setting_values.stylesheets": 2,
+        "profile.managed_default_content_settings.stylesheets": 2,
+        "profile.default_content_setting_values.javascript": 1,
+    }
+    options.add_experimental_option("prefs", prefs)
+
+    options.page_load_strategy = 'eager'
+
+    options.add_argument('--log-level=3')
+
+    options.add_argument('--ignore-certificate-errors')
+    options.add_argument('--allow-insecure-localhost')
+    options.accept_insecure_certs = True
+
     service = Service(executable_path=DRIVER_PATH)
     try:
         driver = webdriver.Edge(service=service, options=options)
-        logging.info("Initialized Selenium WebDriver.")
+        logging.info("Initialized optimized Selenium WebDriver in headless mode.")
+
+        try:
+            driver.execute_cdp_cmd(
+                'Network.setBlockedURLs',
+                {"urls": ["*.css"]}
+            )
+            logging.info("Blocked CSS resources via DevTools Protocol.")
+        except Exception as e:
+            logging.warning(f"Failed to block CSS via CDP: {e}")
+
         return driver
-    except Exception as e:
-        logging.error(f"Failed to initialize WebDriver: {e}")
+    except WebDriverException as e:
+        logging.error(f"WebDriverException during initialization: {e}")
         raise
+    except Exception as e:
+        logging.error(f"Unexpected error initializing WebDriver: {e}")
+        raise
+
 
 class UMPSAConnectApp:
     def __init__(self, root: tk.Tk):
@@ -234,6 +304,7 @@ class UMPSAConnectApp:
         self.root.title("UMPSA Connect")
         self.style = self.set_dark_mode()
         self.auto_login_timer: Optional[threading.Timer] = None
+        self.credentials_lock = threading.Lock()
 
         self.frame = tk.Frame(self.root, bg=self.style['bg'])
         self.frame.pack(padx=20, pady=20)
@@ -255,8 +326,8 @@ class UMPSAConnectApp:
 
         buttons = [
             ("Login", self.initiate_login),
-            ("Register", partial(self.start_registration)),
-            ("Fetch Email", partial(self.fetch_emails))
+            ("Register", self.start_registration),
+            ("Fetch Email", self.fetch_emails)
         ]
 
         for text, cmd in buttons:
@@ -288,17 +359,20 @@ class UMPSAConnectApp:
         """
         Loads and displays the application logo.
         """
+        img_path = resource_path(os.path.join("assets", "logo.png"))  # Ensure img_path is defined before try
         try:
-            img_path = resource_path(os.path.join("assets", "logo.png"))
             with Image.open(img_path) as img:
                 img = img.resize((img.width // 6, img.height // 6), Image.Resampling.LANCZOS)
-                # Use cast to inform the type checker that logo is a PhotoImage
-                logo: tk.PhotoImage = cast(tk.PhotoImage, ImageTk.PhotoImage(img))
+                logo: tk.PhotoImage = ImageTk.PhotoImage(img)
                 tk.Label(self.frame, image=logo, bg=self.style['bg']).pack(pady=(0, 20))
                 self.frame.image = logo
                 logging.info("Loaded and displayed logo.")
+        except FileNotFoundError:
+            logging.error(f"Logo file not found at path: {img_path}")
+        except UnidentifiedImageError:
+            logging.error("Failed to identify image file for logo.")
         except Exception as e:
-            logging.error(f"Error loading logo: {e}")
+            logging.error(f"Unexpected error loading logo: {e}")
 
     def initiate_login(self):
         """
@@ -315,7 +389,8 @@ class UMPSAConnectApp:
             index (int): Index of the user being registered.
         """
         try:
-            with get_webdriver() as driver:
+            with get_webdriver(headless=True) as driver:
+                driver.get(REGISTRATION_SESSION)
                 driver.get(REGISTRATION_URL)
                 form_data = {
                     "guestUser.fieldValues.ui_first_name": "IRedDragonICY",
@@ -327,17 +402,27 @@ class UMPSAConnectApp:
                     "guestUser.fieldValues.ui_ump_staff_name_text": "Mr."
                 }
                 for field, value in form_data.items():
-                    driver.execute_script(f"document.getElementsByName('{field}')[0].value = '{value}';")
-                submit_button = driver.find_element(By.ID, "ui_self_reg_submit_button")
-                submit_button.click()
-                logging.info(f"User {index} registration submitted.")
+                    try:
+                        driver.execute_script(f"document.getElementsByName('{field}')[0].value = '{value}';")
+                    except NoSuchElementException:
+                        logging.warning(f"Field '{field}' not found on the registration page.")
+                try:
+                    submit_button = driver.find_element(By.ID, "ui_self_reg_submit_button")
+                    submit_button.click()
+                    logging.info(f"User {index} registration submitted.")
+                except NoSuchElementException:
+                    logging.error(f"Submit button not found for user {index} registration.")
 
             completed = self.counter.increment()
             percentage = self.counter.get_percentage()
-            self.output_label.config(text=f"Progress: {completed}/{self.counter.total} ({percentage:.2f}%) registrations completed.")
+            self.output_label.config(
+                text=f"Progress: {completed}/{self.counter.total} ({percentage:.2f}%) registrations completed.")
+        except WebDriverException as e:
+            logging.error(f"Selenium WebDriver error during registration {index}: {e}")
+            self.output_label.config(text=f"Selenium error during registration {index}: {e}")
         except Exception as e:
-            logging.error(f"Error during registration {index}: {e}")
-            self.output_label.config(text=f"Error during registration {index}: {e}")
+            logging.error(f"Unexpected error during registration {index}: {e}")
+            self.output_label.config(text=f"Unexpected error during registration {index}: {e}")
 
     def start_registration(self):
         """
@@ -382,15 +467,29 @@ class UMPSAConnectApp:
 
         if credentials_list:
             try:
-                with open(CSV_FILE, 'w', newline='', encoding='utf-8') as csvfile:
-                    writer = csv.DictWriter(csvfile, fieldnames=['Username', 'Password'])
-                    writer.writeheader()
-                    writer.writerows(credentials_list)
-                self.output_label.config(text=f'Credentials saved to {CSV_FILE}')
-                logging.info(f"Saved {len(credentials_list)} credentials to CSV.")
+                with self.credentials_lock:
+                    if os.path.exists(CSV_FILE):
+                        try:
+                            os.replace(CSV_FILE, BACKUP_CSV_FILE)
+                            logging.info("Backed up existing credentials.csv to credentials_backup.csv.")
+                        except OSError as e:
+                            logging.error(f"Failed to backup credentials.csv: {e}")
+                            self.output_label.config(text=f"Failed to backup credentials: {e}")
+                            return
+
+                    try:
+                        with open(CSV_FILE, 'w', newline='', encoding='utf-8') as csvfile:
+                            writer = csv.DictWriter(csvfile, fieldnames=['Username', 'Password'])
+                            writer.writeheader()
+                            writer.writerows(credentials_list)
+                        self.output_label.config(text=f'Credentials saved to {CSV_FILE}')
+                        logging.info(f"Saved {len(credentials_list)} credentials to CSV.")
+                    except IOError as e:
+                        logging.error(f"IOError while writing to CSV: {e}")
+                        self.output_label.config(text=f"Failed to save credentials: {e}")
             except Exception as e:
-                self.output_label.config(text=f"Failed to save credentials: {e}")
-                logging.error(f"Failed to save credentials: {e}")
+                logging.error(f"Unexpected error during email fetching: {e}")
+                self.output_label.config(text=f"Unexpected error: {e}")
         else:
             self.output_label.config(text='No credentials extracted.')
             logging.info("No credentials were extracted from the fetched emails.")
@@ -424,66 +523,184 @@ class UMPSAConnectApp:
     def run_login(self):
         """
         Executes the login process using credentials from the CSV file.
+        Continuously attempts to log in until a successful login occurs or all credentials are exhausted.
         """
         try:
-            with open(CSV_FILE, 'r', newline='', encoding='utf-8') as infile:
-                reader = csv.DictReader(infile)
-                credentials = list(reader)
-                if not credentials:
-                    self.output_label.config(text="No credentials available in CSV.")
-                    logging.warning("Credentials CSV is empty.")
-                    return
-                first_cred = credentials.pop(0)
-                logging.info(f"Attempting login with credentials: {first_cred}")
-        except FileNotFoundError:
-            self.output_label.config(text=f"Credentials file {CSV_FILE} not found.")
-            logging.error(f"Credentials file {CSV_FILE} not found.")
+            driver = get_webdriver(headless=True)
+        except WebDriverException as e:
+            logging.error(f"Failed to initialize WebDriver: {e}")
+            self.output_label.config(text=f"Failed to initialize WebDriver: {e}")
             return
         except Exception as e:
-            self.output_label.config(text=f"Error reading credentials: {e}")
-            logging.error(f"Error reading credentials: {e}")
+            logging.error(f"Unexpected error initializing WebDriver: {e}")
+            self.output_label.config(text=f"Unexpected WebDriver error: {e}")
             return
 
         try:
-            with get_webdriver() as driver:
-                driver.get(LOGIN_URL)
-                wait = WebDriverWait(driver, 10)
-                wait.until(EC.presence_of_element_located((By.ID, "user.username"))).send_keys(first_cred['Username'])
-                driver.find_element(By.ID, "user.password").send_keys(first_cred['Password'])
-                driver.find_element(By.ID, "ui_login_signon_button").click()
-                logging.info("Submitted login form.")
+            while True:
+                current_cred = self.get_first_credential()
+                if not current_cred:
+                    self.output_label.config(text="No credentials available to attempt login.")
+                    logging.warning("No credentials available to attempt login.")
+                    break
+
+                logging.info(f"Attempting login with credentials: {current_cred}")
+                self.output_label.config(text=f"Attempting login with Username: {current_cred['Username']}")
 
                 try:
-                    aup_text = wait.until(EC.presence_of_element_located((By.CLASS_NAME, "cisco-ise-aup-text")))
-                    driver.execute_script("arguments[0].scrollTop = arguments[0].scrollHeight;", aup_text)
-                    accept_button = wait.until(EC.element_to_be_clickable((By.ID, "ui_aup_accept_button")))
-                    accept_button.click()
-                    logging.info("Accepted AUP.")
-                except Exception:
-                    logging.info("AUP not present or already accepted.")
+                    driver.get(LOGIN_URL)
+                    wait = WebDriverWait(driver, 10)
+                    username_field = wait.until(EC.presence_of_element_located((By.ID, "user.username")))
+                    username_field.clear()
+                    username_field.send_keys(current_cred['Username'])
 
-                wait.until(EC.title_is('Success'))
-                self.output_label.config(text="Login successful.")
-                logging.info("Login successful.")
-        except Exception as e:
-            self.output_label.config(text=f"Login error: {e}")
-            logging.error(f"Login error: {e}")
-            return
+                    password_field = driver.find_element(By.ID, "user.password")
+                    password_field.clear()
+                    password_field.send_keys(current_cred['Password'])
 
+                    login_button = driver.find_element(By.ID, "ui_login_signon_button")
+                    login_button.click()
+                    logging.info("Submitted login form.")
+
+                    try:
+                        error_element = WebDriverWait(driver, 5).until(
+                            EC.presence_of_element_located((By.ID, "ui_login_failed_error"))
+                        )
+                        if "Authentication failed" in error_element.text:
+                            logging.warning("Authentication failed with current credentials.")
+                            self.output_label.config(text="Authentication failed. Trying next credentials...")
+                            self.remove_first_credential()
+                            continue  #
+                    except TimeoutException:
+                        pass
+
+                    try:
+                        aup_text = driver.find_element(By.CLASS_NAME, "cisco-ise-aup-text")
+                        driver.execute_script("arguments[0].scrollTop = arguments[0].scrollHeight;", aup_text)
+                        accept_button = driver.find_element(By.ID, "ui_aup_accept_button")
+                        accept_button.click()
+                        logging.info("Accepted AUP.")
+                    except NoSuchElementException:
+                        logging.info("AUP not present or already accepted.")
+
+                    try:
+                        continue_button = driver.find_element(By.ID, "ui_max_devices_continue_button")
+                        continue_button.click()
+                        logging.info("Clicked Continue button for Maximum Devices Reached.")
+
+                    except NoSuchElementException:
+                        logging.info("Maximum Devices Reached not present or already handled.")
+
+                    if self.is_login_successful(driver):
+                        self.output_label.config(text="Login successful.")
+                        logging.info("Login successful.")
+                        self.remove_first_credential()
+                        break
+                    else:
+                        logging.warning("Login might not be successful. Retrying with next credentials.")
+                        self.output_label.config(text="Login may not be successful. Trying next credentials...")
+                        self.remove_first_credential()
+                        continue
+
+                except WebDriverException as e:
+                    logging.error(f"Selenium WebDriver error during login with {current_cred['Username']}: {e}")
+                    self.output_label.config(text=f"Selenium error: {e}. Trying next credentials...")
+                    self.remove_first_credential()
+                    continue
+                except Exception as e:
+                    logging.error(f"Unexpected error during login with {current_cred['Username']}: {e}")
+                    self.output_label.config(text=f"Unexpected error: {e}. Trying next credentials...")
+                    self.remove_first_credential()
+                    continue
+        finally:
+            driver.quit()
+            logging.info("WebDriver closed.")
+
+    @staticmethod
+    def is_login_successful(driver: webdriver.Edge) -> bool:
+        """
+        Determines if the login was successful based on page elements or title.
+
+        Args:
+            driver (webdriver.Edge): The Selenium WebDriver instance.
+
+        Returns:
+            bool: True if login is successful, False otherwise.
+        """
         try:
-            if credentials:
-                with open(CSV_FILE, 'w', newline='', encoding='utf-8') as outfile:
-                    writer = csv.DictWriter(outfile, fieldnames=['Username', 'Password'])
-                    writer.writeheader()
-                    writer.writerows(credentials)
-                logging.info("Updated credentials CSV after login.")
-            else:
-                os.remove(CSV_FILE)
-                self.output_label.config(text="All credentials have been used and removed.")
-                logging.info("All credentials used. Removed CSV file.")
+            success_element = driver.find_element(By.ID, "success_element_id")
+            if success_element:
+                return True
+        except NoSuchElementException:
+            pass
         except Exception as e:
-            self.output_label.config(text=f"Failed to update credentials file: {e}")
-            logging.error(f"Failed to update credentials file: {e}")
+            logging.error(f"Unexpected error while checking login success: {e}")
+
+        # Alternatively, check the page title or URL
+        try:
+            if "dashboard" in driver.current_url.lower():
+                return True
+        except Exception as e:
+            logging.error(f"Unexpected error while checking URL for login success: {e}")
+        return False
+
+    def get_first_credential(self) -> Optional[Dict[str, str]]:
+        """
+        Retrieves the first credential from the CSV file.
+
+        Returns:
+            Optional[Dict[str, str]]: The first credential if available, else None.
+        """
+        with self.credentials_lock:
+            try:
+                with open(CSV_FILE, 'r', newline='', encoding='utf-8') as infile:
+                    reader = csv.DictReader(infile)
+                    credentials = list(reader)
+                    if credentials:
+                        return credentials[0]
+                    else:
+                        return None
+            except FileNotFoundError:
+                logging.error(f"Credentials file {CSV_FILE} not found.")
+                return None
+            except IOError as e:
+                logging.error(f"IOError while reading credentials: {e}")
+                return None
+            except Exception as e:
+                logging.error(f"Unexpected error while reading credentials: {e}")
+                return None
+
+    def remove_first_credential(self):
+        """
+        Removes the first credential from the CSV file.
+        """
+        with self.credentials_lock:
+            try:
+                with open(CSV_FILE, 'r', newline='', encoding='utf-8') as infile:
+                    reader = csv.reader(infile)
+                    rows = list(reader)
+                    if len(rows) <= 1:
+                        self.output_label.config(text="No more credentials available.")
+                        logging.warning("No more credentials to try.")
+                        try:
+                            os.remove(CSV_FILE)
+                            logging.info(f"Removed empty credentials file: {CSV_FILE}")
+                        except OSError as e:
+                            logging.error(f"Failed to remove credentials file: {e}")
+                        return
+                    updated_rows = [rows[0]] + rows[2:]
+                with open(CSV_FILE, 'w', newline='', encoding='utf-8') as outfile:
+                    writer = csv.writer(outfile)
+                    writer.writerows(updated_rows)
+                logging.info("Removed the first credential from CSV.")
+            except FileNotFoundError:
+                logging.error(f"Credentials file {CSV_FILE} not found during removal.")
+            except IOError as e:
+                logging.error(f"IOError while removing credential: {e}")
+                self.output_label.config(text=f"Failed to update credentials: {e}")
+            except Exception as e:
+                logging.error(f"Unexpected error while removing credential: {e}")
+                self.output_label.config(text=f"Unexpected error: {e}")
 
     def on_closing(self):
         """
@@ -495,10 +712,12 @@ class UMPSAConnectApp:
         self.root.destroy()
         logging.info("Application closed.")
 
+
 def main():
     root = tk.Tk()
     _app = UMPSAConnectApp(root)
     root.mainloop()
+
 
 if __name__ == "__main__":
     main()
