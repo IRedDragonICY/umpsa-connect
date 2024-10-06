@@ -9,7 +9,7 @@ import logging
 import sys
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
-from typing import Optional, Dict, List, cast  # Added 'cast'
+from typing import Optional, Dict, List, cast
 
 from bs4 import BeautifulSoup
 from google.auth.transport.requests import Request
