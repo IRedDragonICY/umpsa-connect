@@ -1,11 +1,16 @@
 import base64
+import binascii
 import csv
 import os
 import re
 import threading
 import tkinter as tk
+import logging
+import sys
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
+from typing import Optional, Dict, List
+
 from bs4 import BeautifulSoup
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
@@ -19,51 +24,69 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 from PIL import Image, ImageTk
 
+def resource_path(relative_path):
+    base_path = getattr(sys, '_MEIPASS', os.path.abspath("."))
+    return os.path.join(base_path, relative_path)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='[%(asctime)s] %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler(resource_path("app.log")),
+        logging.StreamHandler()
+    ]
+)
+
 SCOPES = ['https://www.googleapis.com/auth/gmail.readonly']
-TOKEN_FILE = 'token.json'
-CREDENTIALS_FILE = 'client_secret.json'
-CSV_FILE = 'credentials.csv'
+TOKEN_FILE = resource_path('token.json')
+CREDENTIALS_FILE = resource_path('client_secret.json')
+CSV_FILE = resource_path('credentials.csv')
 TOTAL_ACCOUNTS = 5000
 MAX_WORKERS = 50
 REGISTRATION_URL = "https://ise01.umpsa.edu.my:8443/portal/SelfRegistration.action?from=LOGIN"
 LOGIN_URL = "http://2.2.2.2/login.html"
-DRIVER_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'driver/msedgedriver.exe')
+DRIVER_PATH = resource_path(os.path.join('driver', 'msedgedriver.exe'))
+AUTO_LOGIN_INTERVAL = 60 * 60
 
 class Counter:
-    def __init__(self, total):
+    def __init__(self, total: int):
         self.total = total
         self.completed = 0
         self.lock = threading.Lock()
 
-    def increment(self):
+    def increment(self) -> int:
         with self.lock:
             self.completed += 1
             return self.completed
 
-    def get_percentage(self):
+    def get_percentage(self) -> float:
         with self.lock:
-            return (self.completed / self.total) * 100
+            return (self.completed / self.total) * 100 if self.total else 0.0
 
 class GmailService:
-    def __init__(self, token_file=TOKEN_FILE, credentials_file=CREDENTIALS_FILE, scopes=SCOPES):
-        self.service = self.authenticate(token_file, credentials_file, scopes)
+    def __init__(self):
+        self.service = self.authenticate()
 
     @staticmethod
-    def authenticate(token_file, credentials_file, scopes):
+    def authenticate():
         creds = None
-        if os.path.exists(token_file):
-            creds = Credentials.from_authorized_user_file(token_file, scopes)
+        if os.path.exists(TOKEN_FILE):
+            creds = Credentials.from_authorized_user_file(TOKEN_FILE, SCOPES)
+            logging.info("Loaded credentials from token file.")
         if not creds or not creds.valid:
             if creds and creds.expired and creds.refresh_token:
                 creds.refresh(Request())
+                logging.info("Refreshed expired credentials.")
             else:
-                flow = InstalledAppFlow.from_client_secrets_file(credentials_file, scopes)
+                flow = InstalledAppFlow.from_client_secrets_file(CREDENTIALS_FILE, SCOPES)
                 creds = flow.run_local_server(port=0)
-            with open(token_file, 'w') as token:
+                logging.info("Obtained new credentials via OAuth flow.")
+            with open(TOKEN_FILE, 'w') as token:
                 token.write(creds.to_json())
+                logging.info("Saved new credentials to token file.")
         return build('gmail', 'v1', credentials=creds)
 
-    def search_emails(self, query, user_id='me'):
+    def search_emails(self, query: str, user_id: str = 'me') -> List[Dict]:
         try:
             messages = []
             response = self.service.users().messages().list(userId=user_id, q=query).execute()
@@ -72,21 +95,24 @@ class GmailService:
                 response = self.service.users().messages().list(
                     userId=user_id, q=query, pageToken=response['nextPageToken']).execute()
                 messages.extend(response.get('messages', []))
+            logging.info(f"Found {len(messages)} messages matching query.")
             return messages
         except Exception as e:
-            print(f'Error saat mencari email: {e}')
+            logging.error(f'Error searching emails: {e}')
             return []
 
-    def get_email_content(self, msg_id, user_id='me'):
+    def get_email_content(self, msg_id: str, user_id: str = 'me') -> str:
         try:
             message = self.service.users().messages().get(userId=user_id, id=msg_id, format='full').execute()
-            return self.extract_body(message['payload'])
+            body = self.extract_body(message.get('payload', {}))
+            logging.debug(f"Extracted body from message ID {msg_id}.")
+            return body
         except Exception as e:
-            print(f'Gagal mengambil isi email dengan ID {msg_id}: {e}')
+            logging.error(f'Failed to retrieve email with ID {msg_id}: {e}')
             return ''
 
     @staticmethod
-    def extract_body(payload):
+    def extract_body(payload: Dict) -> str:
         if 'parts' in payload:
             for part in payload['parts']:
                 text = GmailService.extract_body(part)
@@ -95,114 +121,213 @@ class GmailService:
         else:
             data = payload.get('body', {}).get('data')
             if data:
-                return base64.urlsafe_b64decode(data).decode('utf-8')
+                try:
+                    return base64.urlsafe_b64decode(data).decode('utf-8')
+                except (binascii.Error, UnicodeDecodeError):
+                    logging.warning("Failed to decode email body.")
+                    return ''
         return ''
 
-def extract_credentials(content):
+def extract_credentials(content: str) -> Optional[Dict[str, str]]:
     soup = BeautifulSoup(content, 'html.parser')
     text = soup.get_text()
-    username = re.search(r'Username:\s*(\S+)', text)
-    password = re.search(r'Password:\s*(\S+)', text)
-    return {
-        'Username': username.group(1).strip() if username else None,
-        'Password': password.group(1).strip() if password else None
-    }
+    username_match = re.search(r'Username:\s*(\S+)', text)
+    password_match = re.search(r'Password:\s*(\S+)', text)
+    if username_match and password_match:
+        creds = {
+            'Username': username_match.group(1).strip(),
+            'Password': password_match.group(1).strip()
+        }
+        logging.info(f"Extracted credentials: {creds}")
+        return creds
+    logging.warning("Failed to extract credentials from email content.")
+    return None
 
-def get_webdriver(headless=True, in_private=True):
+def get_webdriver(headless: bool = True, in_private: bool = True) -> webdriver.Edge:
     options = Options()
     options.use_chromium = True
     if headless:
         options.add_argument('--headless')
         options.add_argument('--disable-gpu')
-
+    if in_private:
+        options.add_argument('--inprivate')
     service = Service(executable_path=DRIVER_PATH)
-    return webdriver.Edge(service=service, options=options)
-
-def register_user(index, output_label, counter):
     try:
-        with get_webdriver() as driver:
-            driver.get(REGISTRATION_URL)
-            form_data = {
-                "guestUser.fieldValues.ui_first_name": "IRedDragonICY",
-                "guestUser.fieldValues.ui_last_name": "IRedDragonICY",
-                "guestUser.fieldValues.ui_email_address": "2200018401@webmail.uad.ac.id",
-                "guestUser.fieldValues.ui_phone_number": "+628000000000",
-                "guestUser.fieldValues.ui_company": "*",
-                "guestUser.fieldValues.ui_reason_visit": "Student Exchange",
-                "guestUser.fieldValues.ui_ump_staff_name_text": "Mr."
-            }
-            for field, value in form_data.items():
-                driver.execute_script(f"document.getElementsByName('{field}')[0].value = '{value}';")
-            driver.find_element(By.ID, "ui_self_reg_submit_button").click()
-
-        completed = counter.increment()
-        percentage = counter.get_percentage()
-        output_label.config(text=f"Progress: {completed}/{counter.total} ({percentage:.2f}%) registrasi selesai.")
+        driver = webdriver.Edge(service=service, options=options)
+        logging.info("Initialized Selenium WebDriver.")
+        return driver
     except Exception as e:
-        output_label.config(text=f"Error selama registrasi {index}: {e}")
+        logging.error(f"Failed to initialize WebDriver: {e}")
+        raise
 
-def start_registration(output_label, counter):
-    output_label.config(text="Registrasi dimulai...")
+class UMPSAConnectApp:
+    def __init__(self, root: tk.Tk):
+        self.root = root
+        self.root.title("UMPSA Connect")
+        self.style = self.set_dark_mode()
+        self.auto_login_timer: Optional[threading.Timer] = None
 
-    def run():
+        self.frame = tk.Frame(self.root, bg=self.style['bg'])
+        self.frame.pack(padx=20, pady=20)
+
+        tk.Label(
+            self.frame,
+            text="UMPSA Connect",
+            bg=self.style['bg'],
+            fg=self.style['fg'],
+            font=('Arial', 16)
+        ).pack(pady=(0, 20))
+
+        self.load_logo()
+
+        self.output_label = tk.Label(self.frame, text="", bg=self.style['bg'], fg=self.style['fg'])
+        self.output_label.pack(pady=(0, 20))
+
+        self.counter = Counter(TOTAL_ACCOUNTS)
+
+        buttons = [
+            ("Login", self.initiate_login),
+            ("Register", partial(self.start_registration)),
+            ("Fetch Email", partial(self.fetch_emails))
+        ]
+
+        for text, cmd in buttons:
+            tk.Button(
+                self.frame,
+                text=text,
+                bg="#4a4a4a",
+                fg=self.style['fg'],
+                width=20,
+                command=cmd
+            ).pack(pady=5)
+
+        self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
+
+    def set_dark_mode(self) -> Dict[str, str]:
+        bg_color = "#2e2e2e"
+        fg_color = "#ffffff"
+        self.root.configure(bg=bg_color)
+        logging.info("Applied dark mode styling.")
+        return {'bg': bg_color, 'fg': fg_color}
+
+    def load_logo(self):
         try:
-            with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-                executor.map(lambda i: register_user(i, output_label, counter), range(1, counter.total + 1))
-            output_label.config(text="Registrasi selesai.")
+            img_path = resource_path(os.path.join("assets", "logo.png"))
+            with Image.open(img_path) as img:
+                img = img.resize((img.width // 6, img.height // 6), Image.Resampling.LANCZOS)
+                logo = ImageTk.PhotoImage(img)
+                tk.Label(self.frame, image=logo, bg=self.style['bg']).pack(pady=(0, 20))
+                self.frame.image = logo
+                logging.info("Loaded and displayed logo.")
         except Exception as e:
-            output_label.config(text=f"Kesalahan saat memulai registrasi: {e}")
+            logging.error(f"Error loading logo: {e}")
 
-    threading.Thread(target=run, daemon=True).start()
+    def initiate_login(self):
+        self.login()
+        self.schedule_auto_login()
 
-def fetch_emails(output_label):
-    output_label.config(text="Mengambil email...")
+    def register_user(self, index: int):
+        try:
+            with get_webdriver() as driver:
+                driver.get(REGISTRATION_URL)
+                form_data = {
+                    "guestUser.fieldValues.ui_first_name": "IRedDragonICY",
+                    "guestUser.fieldValues.ui_last_name": "IRedDragonICY",
+                    "guestUser.fieldValues.ui_email_address": "2200018401@webmail.uad.ac.id",
+                    "guestUser.fieldValues.ui_phone_number": "+628000000000",
+                    "guestUser.fieldValues.ui_company": "*",
+                    "guestUser.fieldValues.ui_reason_visit": "Student Exchange",
+                    "guestUser.fieldValues.ui_ump_staff_name_text": "Mr."
+                }
+                for field, value in form_data.items():
+                    driver.execute_script(f"document.getElementsByName('{field}')[0].value = '{value}';")
+                submit_button = driver.find_element(By.ID, "ui_self_reg_submit_button")
+                submit_button.click()
+                logging.info(f"User {index} registration submitted.")
 
-    def run():
+            completed = self.counter.increment()
+            percentage = self.counter.get_percentage()
+            self.output_label.config(text=f"Progress: {completed}/{self.counter.total} ({percentage:.2f}%) registrations completed.")
+        except Exception as e:
+            logging.error(f"Error during registration {index}: {e}")
+            self.output_label.config(text=f"Error during registration {index}: {e}")
+
+    def start_registration(self):
+        self.output_label.config(text="Registration started...")
+        threading.Thread(target=self.run_registration, daemon=True).start()
+
+    def run_registration(self):
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            executor.map(self.register_user, range(1, self.counter.total + 1))
+        self.output_label.config(text="Registration completed.")
+        logging.info("All registrations completed.")
+
+    def fetch_emails(self):
+        self.output_label.config(text="Fetching emails...")
+        threading.Thread(target=self.run_fetch_emails, daemon=True).start()
+
+    def run_fetch_emails(self):
         gmail_service = GmailService()
         query = 'from:Donotreply@ump.edu.my subject:"Your Guest Account Credentials!"'
         messages = gmail_service.search_emails(query=query)
         if not messages:
-            output_label.config(text='Tidak ada email yang ditemukan.')
+            self.output_label.config(text='No emails found.')
             return
 
         credentials_list = []
         for msg in messages:
             content = gmail_service.get_email_content(msg['id'])
             creds = extract_credentials(content)
-            if creds['Username'] and creds['Password']:
+            if creds:
                 credentials_list.append(creds)
 
         if credentials_list:
             try:
-                with open(CSV_FILE, 'w', newline='') as csvfile:
+                with open(CSV_FILE, 'w', newline='', encoding='utf-8') as csvfile:
                     writer = csv.DictWriter(csvfile, fieldnames=['Username', 'Password'])
                     writer.writeheader()
                     writer.writerows(credentials_list)
-                output_label.config(text=f'Kredensial telah disimpan ke {CSV_FILE}')
+                self.output_label.config(text=f'Credentials saved to {CSV_FILE}')
+                logging.info(f"Saved {len(credentials_list)} credentials to CSV.")
             except Exception as e:
-                output_label.config(text=f"Gagal menyimpan kredensial: {e}")
+                self.output_label.config(text=f"Failed to save credentials: {e}")
+                logging.error(f"Failed to save credentials: {e}")
         else:
-            output_label.config(text='Tidak ada kredensial yang diekstrak.')
+            self.output_label.config(text='No credentials extracted.')
+            logging.info("No credentials were extracted from the fetched emails.")
 
-    threading.Thread(target=run, daemon=True).start()
+    def schedule_auto_login(self, interval: int = AUTO_LOGIN_INTERVAL):
+        self.auto_login_timer = threading.Timer(interval, self.auto_login)
+        self.auto_login_timer.daemon = True
+        self.auto_login_timer.start()
+        logging.info(f"Scheduled auto-login every {interval} seconds.")
 
-def login(output_label):
-    output_label.config(text="Proses login...")
+    def auto_login(self):
+        self.login()
+        self.schedule_auto_login()
 
-    def run():
+    def login(self):
+        self.output_label.config(text="Logging in...")
+        threading.Thread(target=self.run_login, daemon=True).start()
+
+    def run_login(self):
         try:
-            with open(CSV_FILE, 'r', newline='') as infile:
+            with open(CSV_FILE, 'r', newline='', encoding='utf-8') as infile:
                 reader = csv.DictReader(infile)
                 credentials = list(reader)
                 if not credentials:
-                    output_label.config(text="Tidak ada kredensial yang tersedia di file CSV.")
+                    self.output_label.config(text="No credentials available in CSV.")
+                    logging.warning("Credentials CSV is empty.")
                     return
                 first_cred = credentials.pop(0)
+                logging.info(f"Attempting login with credentials: {first_cred}")
         except FileNotFoundError:
-            output_label.config(text=f"File kredensial {CSV_FILE} tidak ditemukan.")
+            self.output_label.config(text=f"Credentials file {CSV_FILE} not found.")
+            logging.error(f"Credentials file {CSV_FILE} not found.")
             return
         except Exception as e:
-            output_label.config(text=f"Terjadi kesalahan saat membaca kredensial: {e}")
+            self.output_label.config(text=f"Error reading credentials: {e}")
+            logging.error(f"Error reading credentials: {e}")
             return
 
         try:
@@ -212,67 +337,50 @@ def login(output_label):
                 wait.until(EC.presence_of_element_located((By.ID, "user.username"))).send_keys(first_cred['Username'])
                 driver.find_element(By.ID, "user.password").send_keys(first_cred['Password'])
                 driver.find_element(By.ID, "ui_login_signon_button").click()
-                aup_text = wait.until(EC.presence_of_element_located((By.CLASS_NAME, "cisco-ise-aup-text")))
-                driver.execute_script("arguments[0].scrollTop = arguments[0].scrollHeight;", aup_text)
-                wait.until(EC.element_to_be_clickable((By.ID, "ui_aup_accept_button"))).click()
+                logging.info("Submitted login form.")
+
+                try:
+                    aup_text = wait.until(EC.presence_of_element_located((By.CLASS_NAME, "cisco-ise-aup-text")))
+                    driver.execute_script("arguments[0].scrollTop = arguments[0].scrollHeight;", aup_text)
+                    accept_button = wait.until(EC.element_to_be_clickable((By.ID, "ui_aup_accept_button")))
+                    accept_button.click()
+                    logging.info("Accepted AUP.")
+                except Exception:
+                    logging.info("AUP not present or already accepted.")
+
                 wait.until(EC.title_is('Success'))
-                output_label.config(text="Login berhasil")
+                self.output_label.config(text="Login successful.")
+                logging.info("Login successful.")
         except Exception as e:
-            output_label.config(text=f"Terjadi kesalahan selama login: {e}")
+            self.output_label.config(text=f"Login error: {e}")
+            logging.error(f"Login error: {e}")
             return
 
         try:
             if credentials:
-                with open(CSV_FILE, 'w', newline='') as outfile:
+                with open(CSV_FILE, 'w', newline='', encoding='utf-8') as outfile:
                     writer = csv.DictWriter(outfile, fieldnames=['Username', 'Password'])
                     writer.writeheader()
                     writer.writerows(credentials)
+                logging.info("Updated credentials CSV after login.")
             else:
                 os.remove(CSV_FILE)
+                self.output_label.config(text="All credentials have been used and removed.")
+                logging.info("All credentials used. Removed CSV file.")
         except Exception as e:
-            output_label.config(text=f"Gagal memperbarui file kredensial: {e}")
+            self.output_label.config(text=f"Failed to update credentials file: {e}")
+            logging.error(f"Failed to update credentials file: {e}")
 
-    threading.Thread(target=run, daemon=True).start()
-
-def set_dark_mode(root):
-    bg_color = "#2e2e2e"
-    fg_color = "#ffffff"
-    root.configure(bg=bg_color)
-    return {'bg': bg_color, 'fg': fg_color}
+    def on_closing(self):
+        if self.auto_login_timer:
+            self.auto_login_timer.cancel()
+            logging.info("Canceled auto-login timer.")
+        self.root.destroy()
+        logging.info("Application closed.")
 
 def main():
     root = tk.Tk()
-    root.title("UMPSA Connect")
-    style = set_dark_mode(root)
-
-    frame = tk.Frame(root, bg=style['bg'])
-    frame.pack(padx=20, pady=20)
-
-    tk.Label(frame, text="UMPSA Connect", bg=style['bg'], fg=style['fg'], font=('Arial', 16)).pack(pady=(0, 20))
-
-    try:
-        img = Image.open("assets/logo.png")
-        img = img.resize((img.width // 6, img.height // 6), Image.Resampling.LANCZOS)
-        logo = ImageTk.PhotoImage(img)
-        tk.Label(frame, image=logo, bg=style['bg']).pack(pady=(0, 20))
-        frame.image = logo
-    except Exception as e:
-        print(f"Error loading logo: {e}")
-
-    output_label = tk.Label(frame, text="", bg=style['bg'], fg=style['fg'])
-    output_label.pack(pady=(0, 20))
-
-    counter = Counter(TOTAL_ACCOUNTS)
-
-    buttons = [
-        ("Login", lambda: login(output_label)),
-        ("Register", partial(start_registration, output_label, counter)),
-        ("Fetch Email", lambda: fetch_emails(output_label))
-    ]
-
-    for text, cmd in buttons:
-        tk.Button(frame, text=text, bg="#4a4a4a", fg=style['fg'], width=20, command=cmd).pack(pady=5)
-
+    _app = UMPSAConnectApp(root)
     root.mainloop()
 
 if __name__ == "__main__":
