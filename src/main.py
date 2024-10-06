@@ -5,6 +5,7 @@ import os
 import re
 import threading
 import tkinter as tk
+from tkinter import ttk, messagebox
 import logging
 import sys
 from concurrent.futures import ThreadPoolExecutor
@@ -160,6 +161,39 @@ def get_webdriver(headless: bool = True, in_private: bool = False) -> webdriver.
         logging.error(f"Failed to initialize WebDriver: {e}")
         raise
 
+class SettingsWindow(tk.Toplevel):
+    def __init__(self, parent, style):
+        super().__init__(parent)
+        self.title("Settings")
+        self.style = style
+        self.configure(bg=self.style['bg'])
+        self.geometry("320x300")
+        self.resizable(False, False)
+
+        ttk.Label(self, text="Settings", font=('Arial', 14, 'bold')).pack(pady=10)
+
+        frame = ttk.Frame(self)
+        frame.pack(pady=10, padx=20, fill='x')
+
+        ttk.Label(frame, text="Auto-login Interval (minutes):").pack(anchor='w', pady=5)
+        self.auto_login_var = tk.IntVar(value=AUTO_LOGIN_INTERVAL // 60)
+        self.auto_login_entry = ttk.Entry(frame, textvariable=self.auto_login_var)
+        self.auto_login_entry.pack(fill='x')
+
+        ttk.Button(self, text="Save", command=self.save_settings).pack(pady=20)
+
+    def save_settings(self):
+        global AUTO_LOGIN_INTERVAL
+        try:
+            interval_minutes = self.auto_login_var.get()
+            AUTO_LOGIN_INTERVAL = interval_minutes * 60
+            messagebox.showinfo("Settings", "Settings saved successfully.")
+            logging.info(f"Auto-login interval set to {AUTO_LOGIN_INTERVAL} seconds.")
+            self.destroy()
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to save settings: {e}")
+            logging.error(f"Failed to save settings: {e}")
+
 class UMPSAConnectApp:
     def __init__(self, root: tk.Tk):
         self.root = root
@@ -167,39 +201,41 @@ class UMPSAConnectApp:
         self.style = self.set_dark_mode()
         self.auto_login_timer: Optional[threading.Timer] = None
 
-        self.frame = tk.Frame(self.root, bg=self.style['bg'])
-        self.frame.pack(padx=20, pady=20)
+        self.root.geometry("320x580")
+        self.root.resizable(False, False)
 
-        tk.Label(
+        self.frame = ttk.Frame(self.root, padding=10)
+        self.frame.pack(fill='both', expand=True)
+
+        ttk.Label(
             self.frame,
             text="UMPSA Connect",
-            bg=self.style['bg'],
-            fg=self.style['fg'],
-            font=('Arial', 16)
-        ).pack(pady=(0, 20))
+            background=self.style['bg'],
+            foreground=self.style['fg'],
+            font=('Arial', 16, 'bold')
+        ).pack(pady=(10, 10))
 
         self.load_logo()
 
-        self.output_label = tk.Label(self.frame, text="", bg=self.style['bg'], fg=self.style['fg'])
-        self.output_label.pack(pady=(0, 20))
+        self.output_label = ttk.Label(self.frame, text="", background=self.style['bg'], foreground=self.style['fg'])
+        self.output_label.pack(pady=(10, 10))
 
         self.counter = Counter(TOTAL_ACCOUNTS)
 
         buttons = [
             ("Login", self.initiate_login),
             ("Register", partial(self.start_registration)),
-            ("Fetch Email", partial(self.fetch_emails))
+            ("Fetch Email", partial(self.fetch_emails)),
+            ("Settings", self.open_settings)
         ]
 
         for text, cmd in buttons:
-            tk.Button(
+            btn = ttk.Button(
                 self.frame,
                 text=text,
-                bg="#4a4a4a",
-                fg=self.style['fg'],
-                width=20,
                 command=cmd
-            ).pack(pady=5)
+            )
+            btn.pack(pady=5, fill='x')
 
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
 
@@ -207,20 +243,31 @@ class UMPSAConnectApp:
         bg_color = "#2e2e2e"
         fg_color = "#ffffff"
         self.root.configure(bg=bg_color)
-        logging.info("Applied dark mode styling.")
+        style = ttk.Style()
+        style.theme_use('clam')
+        style.configure('.', background=bg_color, foreground=fg_color, font=('Arial', 10))
+        style.configure('TButton', padding=6, relief="flat")
+        style.map('TButton',
+                  background=[('active', '#4a4a4a')],
+                  foreground=[('active', 'white')])
+        logging.info("Applied dark mode styling with modern themes.")
         return {'bg': bg_color, 'fg': fg_color}
 
     def load_logo(self):
         try:
             img_path = resource_path(os.path.join("assets", "logo.png"))
             with Image.open(img_path) as img:
-                img = img.resize((img.width // 6, img.height // 6), Image.Resampling.LANCZOS)
+                img = img.resize((int(320 * 0.6), int((320 * 0.6) * img.height / img.width)), Image.Resampling.LANCZOS)
                 logo: tk.PhotoImage = cast(tk.PhotoImage, ImageTk.PhotoImage(img))
-                tk.Label(self.frame, image=logo, bg=self.style['bg']).pack(pady=(0, 20))
+                logo_label = ttk.Label(self.frame, image=logo, background=self.style['bg'])
+                logo_label.pack(pady=(0, 10))
                 self.frame.image = logo
                 logging.info("Loaded and displayed logo.")
         except Exception as e:
             logging.error(f"Error loading logo: {e}")
+
+    def open_settings(self):
+        SettingsWindow(self.root, self.style)
 
     def initiate_login(self):
         self.login()
@@ -346,7 +393,7 @@ class UMPSAConnectApp:
                     accept_button.click()
                     logging.info("Accepted AUP.")
                 except Exception:
-                    logging.info("AUP not present or already accepted.")
+                    logging.info("AUP not present atau sudah diterima.")
 
                 wait.until(EC.title_is('Success'))
                 self.output_label.config(text="Login successful.")
