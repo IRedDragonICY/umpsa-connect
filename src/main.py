@@ -9,7 +9,7 @@ import logging
 import sys
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
-from typing import Optional, Dict, List
+from typing import Optional, Dict, List, cast  # Added 'cast'
 
 from bs4 import BeautifulSoup
 from google.auth.transport.requests import Request
@@ -292,7 +292,8 @@ class UMPSAConnectApp:
             img_path = resource_path(os.path.join("assets", "logo.png"))
             with Image.open(img_path) as img:
                 img = img.resize((img.width // 6, img.height // 6), Image.Resampling.LANCZOS)
-                logo = ImageTk.PhotoImage(img)
+                # Use cast to inform the type checker that logo is a PhotoImage
+                logo: tk.PhotoImage = cast(tk.PhotoImage, ImageTk.PhotoImage(img))
                 tk.Label(self.frame, image=logo, bg=self.style['bg']).pack(pady=(0, 20))
                 self.frame.image = logo
                 logging.info("Loaded and displayed logo.")
