@@ -1,11 +1,4 @@
-import base64
-import binascii
-import csv
-import logging
-import os
-import re
-import sys
-import tkinter as tk
+import base64, binascii, csv, logging, os, re, sys, tkinter as tk
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from threading import Lock, Timer
@@ -24,6 +17,7 @@ from selenium.webdriver.edge.options import Options
 from selenium.webdriver.edge.service import Service
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
+from selenium.common.exceptions import WebDriverException, TimeoutException
 
 SCOPES = ['https://www.googleapis.com/auth/gmail.readonly']
 BASE_PATH = Path(getattr(sys, '_MEIPASS', Path.cwd()))
@@ -64,7 +58,6 @@ class Counter:
         with self.lock:
             return (self.completed / self.total) * 100 if self.total else 0.0
 
-
 def authenticate():
     creds = Credentials.from_authorized_user_file(str(TOKEN_FILE), SCOPES) if TOKEN_FILE.exists() else None
     if creds and creds.valid:
@@ -75,12 +68,10 @@ def authenticate():
     else:
         flow = InstalledAppFlow.from_client_secrets_file(str(CREDENTIALS_FILE), SCOPES)
         creds = flow.run_local_server(port=0)
-        logging.info("Obtained new credentials via OAuth flow.")
         with TOKEN_FILE.open('w') as token:
             token.write(creds.to_json())
             logging.info("Saved new credentials to token file.")
     return build('gmail', 'v1', credentials=creds)
-
 
 class GmailService:
     def __init__(self):
@@ -90,11 +81,13 @@ class GmailService:
         messages = []
         try:
             response = self.service.users().messages().list(userId=user_id, q=query).execute()
-            messages.extend(response.get('messages', []))
-            while 'nextPageToken' in response:
-                response = self.service.users().messages().list(userId=user_id, q=query,
-                                                                pageToken=response['nextPageToken']).execute()
-                messages.extend(response.get('messages', []))
+            while response.get('messages'):
+                messages.extend(response['messages'])
+                if 'nextPageToken' in response:
+                    response = self.service.users().messages().list(userId=user_id, q=query,
+                                                                    pageToken=response['nextPageToken']).execute()
+                else:
+                    break
             logging.info(f"Found {len(messages)} messages matching query.")
         except Exception as e:
             logging.error(f'Error searching emails: {e}')
@@ -103,9 +96,7 @@ class GmailService:
     def get_email_content(self, msg_id: str, user_id: str = 'me') -> str:
         try:
             message = self.service.users().messages().get(userId=user_id, id=msg_id, format='full').execute()
-            body = self.extract_body(message.get('payload', {}))
-            logging.debug(f"Extracted body from message ID {msg_id}.")
-            return body
+            return self.extract_body(message.get('payload', {}))
         except Exception as e:
             logging.error(f'Failed to retrieve email with ID {msg_id}: {e}')
             return ''
@@ -128,8 +119,7 @@ class GmailService:
 
 def extract_credentials(content: str) -> Optional[Dict[str, str]]:
     soup = BeautifulSoup(content, 'html.parser')
-    text = soup.get_text()
-    matches = re.findall(r'(Username|Password):\s*(\S+)', text)
+    matches = re.findall(r'(Username|Password):\s*(\S+)', soup.get_text())
     creds = {k: v.strip() for k, v in matches}
     if 'Username' in creds and 'Password' in creds:
         logging.info(f"Extracted credentials: {creds}")
@@ -137,40 +127,24 @@ def extract_credentials(content: str) -> Optional[Dict[str, str]]:
     logging.warning("Failed to extract credentials from email content.")
     return None
 
-
-def get_webdriver(headless=True, in_private=False) -> webdriver.Edge:
+def get_webdriver(headless=True) -> webdriver.Edge:
     opts = Options()
     opts.use_chromium = True
-
     opts.page_load_strategy = 'eager'
-
     if headless:
         opts.add_argument('--headless=new')
         opts.add_argument('--disable-gpu')
         opts.add_argument('--window-size=1920,1080')
-    if in_private:
-        opts.add_argument('--inprivate')
     opts.add_argument('--disable-extensions')
     opts.add_argument('--disable-cache')
-
     try:
         driver = webdriver.Edge(service=Service(executable_path=str(DRIVER_PATH)), options=opts)
-        driver.execute_cdp_cmd("Network.enable", {})
-        driver.execute_cdp_cmd("Network.setBlockedURLs", {
-            "urls": [
-                "*.css", "*.png", "*.jpg", "*.jpeg",
-                "*.gif", "*.svg", "*.ico", "*.woff",
-                "*.woff2", "*.ttf"
-            ]
-        })
-
-
+        driver.set_page_load_timeout(60)
         logging.info("WebDriver initialized")
         return driver
     except Exception as e:
         logging.error(f"WebDriver initialization failed: {e}")
         raise
-
 
 class SettingsWindow(tk.Toplevel):
     def __init__(self, parent, style):
@@ -179,16 +153,12 @@ class SettingsWindow(tk.Toplevel):
         self.configure(bg=style['bg'])
         self.geometry("320x300")
         self.resizable(False, False)
-
         ttk.Label(self, text="Settings", font=('Arial', 14, 'bold')).pack(pady=10)
-
         frame = ttk.Frame(self)
         frame.pack(pady=10, padx=20, fill='x')
-
         ttk.Label(frame, text="Auto-login Interval (minutes):").pack(anchor='w', pady=5)
         self.auto_login_var = tk.IntVar(value=AUTO_LOGIN_INTERVAL // 60)
         ttk.Entry(frame, textvariable=self.auto_login_var).pack(fill='x')
-
         ttk.Button(self, text="Save", command=self.save_settings).pack(pady=20)
 
     def save_settings(self):
@@ -208,36 +178,27 @@ class UMPSAConnectApp:
         self.root.title("UMPSA Connect")
         self.style = self.set_dark_mode()
         self.auto_login_timer: Optional[Timer] = None
-
         self.root.geometry("320x580")
         self.root.resizable(False, False)
-
         frame = ttk.Frame(self.root, padding=10)
         frame.pack(fill='both', expand=True)
-
         ttk.Label(frame, text="UMPSA Connect",
                   background=self.style['bg'],
                   foreground=self.style['fg'],
                   font=('Arial', 16, 'bold')).pack(pady=(10, 10))
-
         self.load_logo(frame)
-
         self.output_label = ttk.Label(frame, text="", background=self.style['bg'],
                                       foreground=self.style['fg'])
         self.output_label.pack(pady=(10, 10))
-
         self.counter = Counter(TOTAL_ACCOUNTS)
-
         buttons = [
             ("Login", self.initiate_login),
             ("Register", self.start_registration),
             ("Fetch Email", self.fetch_emails),
             ("Settings", self.open_settings)
         ]
-
         for text, cmd in buttons:
             ttk.Button(frame, text=text, command=cmd).pack(pady=5, fill='x')
-
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
 
     def set_dark_mode(self) -> Dict[str, str]:
@@ -255,10 +216,7 @@ class UMPSAConnectApp:
         try:
             img_path = resource_path("assets/logo.png")
             with Image.open(img_path) as img:
-                resized_img = img.resize(
-                    (192, int(192 * img.height / img.width)),
-                    Image.Resampling.LANCZOS
-                )
+                resized_img = img.resize((192, int(192 * img.height / img.width)), Image.Resampling.LANCZOS)
                 logo = ImageTk.PhotoImage(resized_img)
             logo_label = ttk.Label(parent, image=logo, background=self.style['bg'])
             logo_label.image = logo
@@ -291,7 +249,6 @@ class UMPSAConnectApp:
                     driver.execute_script(f"document.getElementsByName('{field}')[0].value = '{value}';")
                 driver.find_element(By.ID, "ui_self_reg_submit_button").click()
                 logging.info(f"User {index} registration submitted.")
-
             completed = self.counter.increment()
             percentage = self.counter.get_percentage()
             self.output_label.config(text=f"Progress: {completed}/{self.counter.total} ({percentage:.2f}%) registrations completed.")
@@ -320,12 +277,7 @@ class UMPSAConnectApp:
         if not messages:
             self.output_label.config(text='No emails found.')
             return
-
-        credentials_list = [
-            creds for msg in messages
-            if (creds := extract_credentials(gmail_service.get_email_content(msg['id'])))
-        ]
-
+        credentials_list = [creds for msg in messages if (creds := extract_credentials(gmail_service.get_email_content(msg['id'])))]
         if credentials_list:
             try:
                 with CSV_FILE.open('w', newline='', encoding='utf-8') as csvfile:
@@ -357,7 +309,6 @@ class UMPSAConnectApp:
 
     def run_login(self):
         try:
-            # Membaca kredensial dari file CSV
             with CSV_FILE.open('r', newline='', encoding='utf-8') as infile:
                 reader = csv.DictReader(infile)
                 credentials = list(reader)
@@ -365,7 +316,7 @@ class UMPSAConnectApp:
                     self.output_label.config(text="No credentials available in CSV.")
                     logging.warning("Credentials CSV is empty.")
                     return
-                first_cred = credentials.pop(0)  # Mengambil kredensial pertama
+                first_cred = credentials.pop(0)
                 logging.info(f"Attempting login with credentials: {first_cred}")
         except FileNotFoundError:
             self.output_label.config(text=f"Credentials file {CSV_FILE} not found.")
@@ -376,31 +327,49 @@ class UMPSAConnectApp:
             logging.error(f"Error reading credentials: {e}")
             return
 
-        # Bagian proses login
-        try:
-            with get_webdriver() as driver:
-                driver.get(LOGIN_URL)
-                wait = WebDriverWait(driver, 10)
-                wait.until(EC.presence_of_element_located((By.ID, "user.username"))).send_keys(first_cred['Username'])
-                driver.find_element(By.ID, "user.password").send_keys(first_cred['Password'])
-                driver.find_element(By.ID, "ui_login_signon_button").click()
-                logging.info("Submitted login form.")
+        max_retries = 3
+        for attempt in range(1, max_retries + 1):
+            try:
+                with get_webdriver() as driver:
+                    driver.get(LOGIN_URL)
+                    wait = WebDriverWait(driver, 20)
+                    wait.until(EC.presence_of_element_located((By.ID, "user.username"))).send_keys(first_cred['Username'])
+                    driver.find_element(By.ID, "user.password").send_keys(first_cred['Password'])
+                    driver.find_element(By.ID, "ui_login_signon_button").click()
+                    logging.info("Submitted login form.")
 
-                try:
-                    aup_text = wait.until(EC.presence_of_element_located((By.CLASS_NAME, "cisco-ise-aup-text")))
-                    driver.execute_script("arguments[0].scrollTop = arguments[0].scrollHeight;", aup_text)
-                    wait.until(EC.element_to_be_clickable((By.ID, "ui_aup_accept_button"))).click()
-                    logging.info("Accepted AUP.")
-                except Exception:
-                    logging.info("AUP not present or already accepted.")
+                    try:
+                        aup_text = wait.until(EC.presence_of_element_located((By.CLASS_NAME, "cisco-ise-aup-text")))
+                        driver.execute_script("arguments[0].scrollTop = arguments[0].scrollHeight;", aup_text)
+                        wait.until(EC.element_to_be_clickable((By.ID, "ui_aup_accept_button"))).click()
+                        logging.info("Accepted AUP.")
+                    except TimeoutException:
+                        logging.info("AUP not present or already accepted.")
 
-                wait.until(EC.title_is('Success'))
-                self.output_label.config(text="Login successful.")
-                logging.info("Login successful.")
-        except Exception as e:
-            self.output_label.config(text=f"Login error: {e}")
-            logging.error(f"Login error: {e}")
-            return
+                    wait.until(EC.title_is('Success'))
+                    self.output_label.config(text="Login successful.")
+                    logging.info("Login successful.")
+                    break
+            except TimeoutException:
+                logging.error(f"Login attempt {attempt} timed out.")
+                if attempt == max_retries:
+                    self.output_label.config(text="Login failed due to timeout.")
+                    logging.error("Max login attempts reached. Login failed.")
+            except WebDriverException as e:
+                if "disconnected" in str(e):
+                    logging.error("WebDriver disconnected. Reinitializing login process.")
+                    self.output_label.config(text="Connection lost, retrying login...")
+                    if attempt == max_retries:
+                        self.output_label.config(text="Login failed due to WebDriver disconnection.")
+                        logging.error("Max login attempts reached. Login failed.")
+                else:
+                    self.output_label.config(text=f"Login error: {e}")
+                    logging.error(f"Login error: {e}")
+                    break
+            except Exception as e:
+                self.output_label.config(text=f"Unexpected error during login: {e}")
+                logging.error(f"Unexpected error during login: {e}")
+                break
 
         try:
             if credentials:
