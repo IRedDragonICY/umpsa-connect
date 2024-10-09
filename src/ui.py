@@ -223,17 +223,24 @@ class UMPSAConnectApp:
             self.output_label.config(text="Error reading credentials.")
             logger.error("Error reading credentials: %s", e)
             return
-        max_retries = 3
+
+        max_retries = 5
         for attempt in range(max_retries):
             logger.info("Login attempt %d.", attempt + 1)
             try:
                 with get_webdriver(self.CONFIG.settings['headless']) as driver:
                     driver.get(self.LOGIN_URL)
-                    wait = WebDriverWait(driver, 20)
-                    wait.until(EC.presence_of_element_located((By.ID, "user.username"))).send_keys(first_cred['Username'])
-                    driver.find_element(By.ID, "user.password").send_keys(first_cred['Password'])
+
+                    wait = WebDriverWait(driver, 30)
+                    username_field = wait.until(EC.presence_of_element_located((By.ID, "user.username")))
+                    username_field.send_keys(first_cred['Username'])
+
+                    password_field = driver.find_element(By.ID, "user.password")
+                    password_field.send_keys(first_cred['Password'])
+
                     driver.find_element(By.ID, "ui_login_signon_button").click()
                     logger.debug("Login form submitted.")
+
                     try:
                         aup_text = wait.until(EC.presence_of_element_located((By.CLASS_NAME, "cisco-ise-aup-text")))
                         driver.execute_script("arguments[0].scrollTop = arguments[0].scrollHeight;", aup_text)
@@ -241,15 +248,20 @@ class UMPSAConnectApp:
                         logger.debug("Accepted AUP.")
                     except TimeoutException:
                         logger.debug("AUP not presented.")
+
                     wait.until(EC.title_is('Success'))
                     self.output_label.config(text="Login successful.")
                     logger.info("Login successful.")
                     break
+            except TimeoutException as e:
+                logger.error("Login attempt %d failed: Timeout occurred - %s", attempt + 1, e)
             except Exception as e:
                 logger.error("Login attempt %d failed: %s", attempt + 1, e)
-                if attempt == max_retries - 1:
-                    self.output_label.config(text="Login failed.")
-                    logger.error("All login attempts failed.")
+
+            if attempt == max_retries - 1:
+                self.output_label.config(text="Login failed.")
+                logger.error("All login attempts failed.")
+
         if credentials:
             with self.CREDENTIALS_CSV.open('w', newline='', encoding='utf-8') as outfile:
                 writer = csv.DictWriter(outfile, fieldnames=['Username', 'Password'])
