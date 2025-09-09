@@ -1,5 +1,5 @@
 selenium~=4.25.0
-protobuf~=5.28.2
+protobuf~=6.32.0
 google-auth-oauthlib~=1.2.1
 google-api-python-client~=2.147.0
 bs4~=0.0.2
