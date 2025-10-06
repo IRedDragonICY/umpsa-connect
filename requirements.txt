@@ -1,4 +1,4 @@
-selenium~=4.25.0
+selenium~=4.36.0
 protobuf~=6.32.0
 google-auth-oauthlib~=1.2.1
 google-api-python-client~=2.156.0
